@@ -31,6 +31,7 @@ from .conv import Conv2d, BatchNorm2d, im2col_indices, col2im_indices
 from .dense import Dense, Flatten
 from .pooling import MaxPooling, AvgPooling
 from .losses import Softmax, CrossEntropyLoss, MSELoss, BCELoss
+from .optimizers import Adam, SGD
 
 
 __all__ = [
@@ -46,4 +47,7 @@ __all__ = [
     'MaxPooling', 'AvgPooling',
     # Losses
     'Softmax', 'CrossEntropyLoss', 'MSELoss', 'BCELoss',
+    # Optimizers
+    'Adam', 'SGD',
 ]
+

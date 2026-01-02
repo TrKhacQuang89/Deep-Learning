@@ -22,10 +22,10 @@ def get_im2col_indices(x_shape, field_height, field_width, padding=1, stride=1):
         tuple: Indices (k, i, j) for indexing into padded input
     """
     N, C, H, W = x_shape
-    assert (H + 2 * padding - field_height) % stride == 0
-    assert (W + 2 * padding - field_width) % stride == 0
-    out_height = int((H + 2 * padding - field_height) / stride + 1)
-    out_width = int((W + 2 * padding - field_width) / stride + 1)
+    
+    # Use floor division like PyTorch (no assertions)
+    out_height = (H + 2 * padding - field_height) // stride + 1
+    out_width = (W + 2 * padding - field_width) // stride + 1
 
     i0 = cp.repeat(cp.arange(field_height), field_width)
     i0 = cp.tile(i0, C)
@@ -80,6 +80,8 @@ def col2im_indices(cols, x_shape, field_height, field_width, padding=1, stride=1
     Returns:
         x_padded: Reconstructed 4D tensor
     """
+    import cupyx
+    
     N, C, H, W = x_shape
     H_padded, W_padded = H + 2 * padding, W + 2 * padding
     x_padded = cp.zeros((N, C, H_padded, W_padded), dtype=cols.dtype)
@@ -88,8 +90,8 @@ def col2im_indices(cols, x_shape, field_height, field_width, padding=1, stride=1
     cols_reshaped = cols.reshape(C * field_height * field_width, -1, N)
     cols_reshaped = cols_reshaped.transpose(2, 0, 1)
     
-    # CuPy's scatter_add for accumulation
-    cp.scatter_add(x_padded, (slice(None), k, i, j), cols_reshaped)
+    # CuPy's scatter_add is in cupyx module
+    cupyx.scatter_add(x_padded, (slice(None), k, i, j), cols_reshaped)
     
     if padding == 0:
         return x_padded
@@ -99,18 +101,32 @@ def col2im_indices(cols, x_shape, field_height, field_width, padding=1, stride=1
 class Conv2d(Layer):
     """
     Convolutional Layer using im2col for efficient GPU computation.
+    
+    Args:
+        in_channels: Number of input channels
+        out_channels: Number of output channels
+        kernel_size: Size of convolution kernel
+        stride: Stride of convolution
+        padding: Padding size
+        bias: If True, adds a learnable bias (default: True)
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
+        self.use_bias = bias
 
-        # Xavier/He initialization on GPU
-        scale = cp.sqrt(2.0 / (in_channels * kernel_size * kernel_size))
+        # Kaiming/He initialization on GPU (fan_out mode like PyTorch)
+        fan_out = out_channels * kernel_size * kernel_size
+        scale = cp.sqrt(2.0 / fan_out)
         self.W = cp.random.randn(out_channels, in_channels, kernel_size, kernel_size).astype(cp.float32) * scale
-        self.b = cp.zeros(out_channels, dtype=cp.float32)
+        
+        if self.use_bias:
+            self.b = cp.zeros(out_channels, dtype=cp.float32)
+        else:
+            self.b = None
         
         self.x = None
         self.x_cols = None
@@ -132,8 +148,10 @@ class Conv2d(Layer):
         # Reshape weights
         w_col = self.W.reshape(n_filters, -1)
 
-        # Matrix multiplication: Output = W @ X_cols + b
-        out = w_col @ self.x_cols + self.b.reshape(-1, 1)
+        # Matrix multiplication: Output = W @ X_cols (+ b if bias)
+        out = w_col @ self.x_cols
+        if self.use_bias:
+            out = out + self.b.reshape(-1, 1)
         
         # Reshape to image format
         out = out.reshape(n_filters, out_h, out_w, N)
@@ -148,7 +166,10 @@ class Conv2d(Layer):
         dout_reshaped = dout.transpose(1, 2, 3, 0).reshape(n_filters, -1)
         
         # Gradient of bias
-        self.db = cp.sum(dout_reshaped, axis=1)
+        if self.use_bias:
+            self.db = cp.sum(dout_reshaped, axis=1)
+        else:
+            self.db = None
         
         # Gradient of weights
         self.dW = (dout_reshaped @ self.x_cols.T).reshape(self.W.shape)
