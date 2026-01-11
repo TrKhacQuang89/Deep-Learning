@@ -9,7 +9,9 @@ Matches PyTorch DetectorBase EXACTLY:
 - Dropout2d (channel-wise dropout)
 
 Input: (N, 3, 224, 224)
-Output: (N, 8, 7, 7) = Grid 7x7, each cell predicts [x, y, w, h, conf, c1, c2, c3]
+Output: 
+    - Detection mode: (N, 8, 7, 7) = Grid 7x7, each cell predicts [x, y, w, h, conf, c1, c2, c3]
+    - Classification mode: (N, num_classes) = Class probabilities
 """
 
 import cupy as cp
@@ -294,12 +296,14 @@ class DetectorBase:
         lateral_channels: int,
         num_classes: int = 3,
         dropout: float = 0.1,
-        use_se: bool = True
+        use_se: bool = True,
+        classifier: bool = False
     ):
         self.num_classes = num_classes
         self.output_channels = 5 + num_classes
         self.dropout_rate = dropout
         self.use_se = use_se
+        self.classifier = classifier
         self.training = True
         
         c1, c2, c3, c4 = stage_channels
@@ -327,13 +331,27 @@ class DetectorBase:
         # Dropout
         self.dropout = Dropout2d(p=dropout)
         
-        # Detection head (bias=False for first two convs, bias=True for last)
         fused_channels = lateral_channels * 4
-        self.head_conv1 = Conv2d(fused_channels, 256, kernel_size=3, padding=1, bias=False)
-        self.head_bn1 = BatchNorm2d(256)
-        self.head_conv2 = Conv2d(256, 128, kernel_size=3, padding=1, bias=False)
-        self.head_bn2 = BatchNorm2d(128)
-        self.head_conv3 = Conv2d(128, self.output_channels, kernel_size=1, padding=0, bias=True)
+        
+        if self.classifier:
+            # Classification head: GlobalAvgPool → FC → Softmax
+            # FC layer with Kaiming init
+            scale = cp.sqrt(2.0 / fused_channels)
+            self.cls_fc_W = cp.random.randn(fused_channels, num_classes).astype(cp.float32) * scale
+            self.cls_fc_b = cp.zeros(num_classes, dtype=cp.float32)
+            # Gradients
+            self.dcls_fc_W = None
+            self.dcls_fc_b = None
+            # Cache
+            self.cls_pooled = None
+            self.cls_logits = None
+        else:
+            # Detection head (bias=False for first two convs, bias=True for last)
+            self.head_conv1 = Conv2d(fused_channels, 256, kernel_size=3, padding=1, bias=False)
+            self.head_bn1 = BatchNorm2d(256)
+            self.head_conv2 = Conv2d(256, 128, kernel_size=3, padding=1, bias=False)
+            self.head_bn2 = BatchNorm2d(128)
+            self.head_conv3 = Conv2d(128, self.output_channels, kernel_size=1, padding=0, bias=True)
         
         self.sigmoid = Sigmoid()
         
@@ -374,12 +392,13 @@ class DetectorBase:
         for lat in [self.lateral1, self.lateral2, self.lateral3, self.lateral4]:
             self.all_layers.extend([lat['conv'], lat['bn']])
         
-        # Head
-        self.all_layers.extend([
-            self.head_conv1, self.head_bn1,
-            self.head_conv2, self.head_bn2,
-            self.head_conv3
-        ])
+        # Head (only for detection mode - classifier uses FC which is tracked separately)
+        if not self.classifier:
+            self.all_layers.extend([
+                self.head_conv1, self.head_bn1,
+                self.head_conv2, self.head_bn2,
+                self.head_conv3
+            ])
     
     def _make_stage(self, in_ch, out_ch, num_blocks, stride):
         blocks = [ResidualBlock(in_ch, out_ch, stride=stride, use_se=self.use_se)]
@@ -445,31 +464,41 @@ class DetectorBase:
         # Dropout
         fused = self.dropout.forward(self.fused)
         
-        # Head
-        out = self.head_conv1.forward(fused)
-        out = self.head_bn1.forward(out)
-        self.head1_out = out
-        out = out * (1 / (1 + cp.exp(-out)))  # SiLU
-        
-        out = self.head_conv2.forward(out)
-        out = self.head_bn2.forward(out)
-        self.head2_out = out
-        out = out * (1 / (1 + cp.exp(-out)))  # SiLU
-        
-        self.raw_output = self.head_conv3.forward(out)
-        
-        # Output activations (same as PyTorch)
-        box_xy = self.sigmoid.forward(self.raw_output[:, 0:2, :, :])
-        box_wh = self.sigmoid.forward(self.raw_output[:, 2:4, :, :])
-        conf = self.sigmoid.forward(self.raw_output[:, 4:5, :, :])
-        
-        # Softmax for class probs
-        cls_logits = self.raw_output[:, 5:, :, :]
-        cls_exp = cp.exp(cls_logits - cp.max(cls_logits, axis=1, keepdims=True))
-        cls_probs = cls_exp / cp.sum(cls_exp, axis=1, keepdims=True)
-        
-        self.output = cp.concatenate([box_xy, box_wh, conf, cls_probs], axis=1)
-        return self.output
+        if self.classifier:
+            # Classification head: GlobalAvgPool → FC → Softmax
+            self.cls_pooled = fused.mean(axis=(2, 3))  # (N, fused_channels)
+            self.cls_logits = self.cls_pooled @ self.cls_fc_W + self.cls_fc_b  # (N, num_classes)
+            
+            # Softmax
+            cls_exp = cp.exp(self.cls_logits - cp.max(self.cls_logits, axis=1, keepdims=True))
+            self.output = cls_exp / cp.sum(cls_exp, axis=1, keepdims=True)  # (N, num_classes)
+            return self.output
+        else:
+            # Detection head
+            out = self.head_conv1.forward(fused)
+            out = self.head_bn1.forward(out)
+            self.head1_out = out
+            out = out * (1 / (1 + cp.exp(-out)))  # SiLU
+            
+            out = self.head_conv2.forward(out)
+            out = self.head_bn2.forward(out)
+            self.head2_out = out
+            out = out * (1 / (1 + cp.exp(-out)))  # SiLU
+            
+            self.raw_output = self.head_conv3.forward(out)
+            
+            # Output activations (same as PyTorch)
+            box_xy = self.sigmoid.forward(self.raw_output[:, 0:2, :, :])
+            box_wh = self.sigmoid.forward(self.raw_output[:, 2:4, :, :])
+            conf = self.sigmoid.forward(self.raw_output[:, 4:5, :, :])
+            
+            # Softmax for class probs
+            cls_logits = self.raw_output[:, 5:, :, :]
+            cls_exp = cp.exp(cls_logits - cp.max(cls_logits, axis=1, keepdims=True))
+            cls_probs = cls_exp / cp.sum(cls_exp, axis=1, keepdims=True)
+            
+            self.output = cp.concatenate([box_xy, box_wh, conf, cls_probs], axis=1)
+            return self.output
     
     def _forward_lateral(self, x, lateral):
         out = lateral['conv'].forward(x)
@@ -482,39 +511,59 @@ class DetectorBase:
     
     def backward(self, grad_output):
         """Full backward pass through entire network."""
-        N, C, H, W = grad_output.shape
         
-        # Gradient through output activations
-        grad_box_xy = grad_output[:, 0:2, :, :] * self.output[:, 0:2, :, :] * (1 - self.output[:, 0:2, :, :])
-        grad_box_wh = grad_output[:, 2:4, :, :] * self.output[:, 2:4, :, :] * (1 - self.output[:, 2:4, :, :])
-        grad_conf = grad_output[:, 4:5, :, :] * self.output[:, 4:5, :, :] * (1 - self.output[:, 4:5, :, :])
-        grad_cls = grad_output[:, 5:, :, :]
-        
-        grad = cp.concatenate([grad_box_xy, grad_box_wh, grad_conf, grad_cls], axis=1)
-        
-        # Backward through head_conv3
-        grad = self.head_conv3.backward(grad)
-        
-        # Backward through head2 SiLU
-        sigmoid_h2 = 1 / (1 + cp.exp(-self.head2_out))
-        silu_grad_h2 = sigmoid_h2 * (1 + self.head2_out * (1 - sigmoid_h2))
-        grad = grad * silu_grad_h2
-        
-        # Backward through head_bn2, head_conv2
-        grad = self.head_bn2.backward(grad)
-        grad = self.head_conv2.backward(grad)
-        
-        # Backward through head1 SiLU
-        sigmoid_h1 = 1 / (1 + cp.exp(-self.head1_out))
-        silu_grad_h1 = sigmoid_h1 * (1 + self.head1_out * (1 - sigmoid_h1))
-        grad = grad * silu_grad_h1
-        
-        # Backward through head_bn1, head_conv1
-        grad = self.head_bn1.backward(grad)
-        grad = self.head_conv1.backward(grad)
-        
-        # Backward through dropout
-        grad = self.dropout.backward(grad)
+        if self.classifier:
+            # Classification backward
+            # grad_output shape: (N, num_classes) - gradient of loss w.r.t. softmax output
+            N = grad_output.shape[0]
+            
+            # Gradient through FC layer
+            self.dcls_fc_W = self.cls_pooled.T @ grad_output  # (fused_channels, num_classes)
+            self.dcls_fc_b = grad_output.sum(axis=0)  # (num_classes,)
+            d_pooled = grad_output @ self.cls_fc_W.T  # (N, fused_channels)
+            
+            # Gradient through global average pooling
+            _, C, H, W = self.fused.shape
+            grad = d_pooled.reshape(N, C, 1, 1) / (H * W)
+            grad = cp.broadcast_to(grad, self.fused.shape).copy()
+            
+            # Backward through dropout
+            grad = self.dropout.backward(grad)
+        else:
+            # Detection backward
+            N, C, H, W = grad_output.shape
+            
+            # Gradient through output activations
+            grad_box_xy = grad_output[:, 0:2, :, :] * self.output[:, 0:2, :, :] * (1 - self.output[:, 0:2, :, :])
+            grad_box_wh = grad_output[:, 2:4, :, :] * self.output[:, 2:4, :, :] * (1 - self.output[:, 2:4, :, :])
+            grad_conf = grad_output[:, 4:5, :, :] * self.output[:, 4:5, :, :] * (1 - self.output[:, 4:5, :, :])
+            grad_cls = grad_output[:, 5:, :, :]
+            
+            grad = cp.concatenate([grad_box_xy, grad_box_wh, grad_conf, grad_cls], axis=1)
+            
+            # Backward through head_conv3
+            grad = self.head_conv3.backward(grad)
+            
+            # Backward through head2 SiLU
+            sigmoid_h2 = 1 / (1 + cp.exp(-self.head2_out))
+            silu_grad_h2 = sigmoid_h2 * (1 + self.head2_out * (1 - sigmoid_h2))
+            grad = grad * silu_grad_h2
+            
+            # Backward through head_bn2, head_conv2
+            grad = self.head_bn2.backward(grad)
+            grad = self.head_conv2.backward(grad)
+            
+            # Backward through head1 SiLU
+            sigmoid_h1 = 1 / (1 + cp.exp(-self.head1_out))
+            silu_grad_h1 = sigmoid_h1 * (1 + self.head1_out * (1 - sigmoid_h1))
+            grad = grad * silu_grad_h1
+            
+            # Backward through head_bn1, head_conv1
+            grad = self.head_bn1.backward(grad)
+            grad = self.head_conv1.backward(grad)
+            
+            # Backward through dropout
+            grad = self.dropout.backward(grad)
         
         # Split gradient for laterals
         lat_ch = self.l1.shape[1]
@@ -582,6 +631,11 @@ class DetectorBase:
                 total += layer.gamma.size + layer.beta.size
             if hasattr(layer, 'fc1_W'):
                 total += layer.fc1_W.size + layer.fc2_W.size
+        
+        # Add classifier FC params if in classifier mode
+        if self.classifier:
+            total += self.cls_fc_W.size + self.cls_fc_b.size
+        
         return total
 
 
@@ -589,7 +643,17 @@ class DetectorBase:
 # Factory Function
 # =============================================================================
 
-def get_model(size: str = 'large', num_classes: int = 3) -> DetectorBase:
+def get_model(size: str = 'large', num_classes: int = 3, classifier: bool = False) -> DetectorBase:
+    """Create a model with the specified configuration.
+    
+    Args:
+        size: Model size ('tiny', 'small', 'medium', 'large', 'xlarge', 'huge')
+        num_classes: Number of output classes
+        classifier: If True, use classification head instead of detection head
+    
+    Returns:
+        DetectorBase model instance
+    """
     if size not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model size: {size}. Choose from {list(MODEL_CONFIGS.keys())}")
     
@@ -599,11 +663,12 @@ def get_model(size: str = 'large', num_classes: int = 3) -> DetectorBase:
         stage_blocks=config['stage_blocks'],
         lateral_channels=config['lateral_channels'],
         num_classes=num_classes,
-        use_se=config['use_se']
+        use_se=config['use_se'],
+        classifier=classifier
     )
 
 
-# Convenience aliases
+# Convenience aliases for detectors
 TinyDetector = lambda num_classes=3: get_model('tiny', num_classes)
 SmallDetector = lambda num_classes=3: get_model('small', num_classes)
 MediumDetector = lambda num_classes=3: get_model('medium', num_classes)
@@ -613,13 +678,34 @@ HugeDetector = lambda num_classes=3: get_model('huge', num_classes)
 
 SimpleDetector = LargeDetector
 
+# Convenience aliases for classifiers
+TinyClassifier = lambda num_classes=3: get_model('tiny', num_classes, classifier=True)
+SmallClassifier = lambda num_classes=3: get_model('small', num_classes, classifier=True)
+MediumClassifier = lambda num_classes=3: get_model('medium', num_classes, classifier=True)
+LargeClassifier = lambda num_classes=3: get_model('large', num_classes, classifier=True)
+XLargeClassifier = lambda num_classes=3: get_model('xlarge', num_classes, classifier=True)
+HugeClassifier = lambda num_classes=3: get_model('huge', num_classes, classifier=True)
+
+SimpleClassifier = LargeClassifier
+
 
 if __name__ == "__main__":
     print("Testing CuPy Detector (PyTorch-compatible)")
     x = cp.random.randn(2, 3, 224, 224).astype(cp.float32)
-    model = get_model('tiny')
-    print(f"Parameters: {model.get_params_count():,}")
     
+    # Test detector
+    print("\n--- Detector Mode ---")
+    model = get_model('tiny', classifier=False)
+    print(f"Parameters: {model.get_params_count():,}")
     output = model.forward(x)
     print(f"Output shape: {output.shape}")
-    print("[OK] Forward pass works!")
+    print("[OK] Detector forward pass works!")
+    
+    # Test classifier
+    print("\n--- Classifier Mode ---")
+    classifier = get_model('tiny', num_classes=10, classifier=True)
+    print(f"Parameters: {classifier.get_params_count():,}")
+    output = classifier.forward(x)
+    print(f"Output shape: {output.shape}")
+    print(f"Sum of probs per sample: {output.sum(axis=1)}")
+    print("[OK] Classifier forward pass works!")

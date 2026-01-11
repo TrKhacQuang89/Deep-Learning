@@ -9,7 +9,9 @@ Creates 4 model sizes for experimentation:
 - LargeDetector: ~6.2M params
 
 Input: (N, 3, 224, 224)
-Output: (N, 8, 7, 7) = Grid 7x7, each cell predicts [x, y, w, h, conf, c1, c2, c3]
+Output: 
+    - Detection mode: (N, 8, 7, 7) = Grid 7x7, each cell predicts [x, y, w, h, conf, c1, c2, c3]
+    - Classification mode: (N, num_classes) = Class probabilities
 """
 
 import torch
@@ -47,7 +49,8 @@ class DetectorBase(nn.Module):
         lateral_channels: int,     # Common channel size for lateral connections
         num_classes: int = 3,
         dropout: float = 0.1,
-        use_se: bool = True        # Whether to use SE attention
+        use_se: bool = True,        # Whether to use SE attention
+        classifier: bool = False
     ):
         """
         Args:
@@ -57,12 +60,14 @@ class DetectorBase(nn.Module):
             num_classes: Number of object classes
             dropout: Dropout rate
             use_se: Whether to use SE attention in residual blocks
+            classifier: Whether to use classification head instead of detection head
         """
         super().__init__()
         
         self.num_classes = num_classes
         self.output_channels = 5 + num_classes
         self.use_se = use_se
+        self.classifier = classifier
         
         c1, c2, c3, c4 = stage_channels
         n1, n2, n3, n4 = stage_blocks
@@ -109,17 +114,26 @@ class DetectorBase(nn.Module):
         # Fused channels from 4 laterals
         fused_channels = lateral_channels * 4
         
-        # Detection head
         self.dropout = nn.Dropout2d(p=dropout)
-        self.head = nn.Sequential(
-            nn.Conv2d(fused_channels, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(128, self.output_channels, kernel_size=1)
-        )
+        
+        if self.classifier:
+            # Classification head
+            self.head = nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(fused_channels, num_classes)
+            )
+        else:
+            # Detection head
+            self.head = nn.Sequential(
+                nn.Conv2d(fused_channels, 256, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(256),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(128, self.output_channels, kernel_size=1)
+            )
         
         self._init_weights()
     
@@ -174,18 +188,25 @@ class DetectorBase(nn.Module):
         # Fuse all scales
         fused = torch.cat([l1, l2, l3, l4], dim=1)
         
-        # Detection head
+        # Dropout
         fused = self.dropout(fused)
-        out = self.head(fused)
         
-        # Apply activations
-        box_xy = torch.sigmoid(out[:, 0:2, :, :])
-        box_wh = torch.sigmoid(out[:, 2:4, :, :])
-        conf = torch.sigmoid(out[:, 4:5, :, :])
-        cls_probs = F.softmax(out[:, 5:, :, :], dim=1)
-        
-        output = torch.cat([box_xy, box_wh, conf, cls_probs], dim=1)
-        return output
+        if self.classifier:
+            # Return raw logits (CrossEntropyLoss applies softmax internally)
+            logits = self.head(fused)
+            return logits
+        else:
+            # Detection head
+            out = self.head(fused)
+            
+            # Apply activations
+            box_xy = torch.sigmoid(out[:, 0:2, :, :])
+            box_wh = torch.sigmoid(out[:, 2:4, :, :])
+            conf = torch.sigmoid(out[:, 4:5, :, :])
+            cls_probs = F.softmax(out[:, 5:, :, :], dim=1)
+            
+            output = torch.cat([box_xy, box_wh, conf, cls_probs], dim=1)
+            return output
     
     def get_params_count(self):
         """Count total parameters."""
@@ -197,13 +218,14 @@ class TinyDetector(DetectorBase):
     Tiny detector - lightweight for quick experiments.
     Stages: [32, 64, 128, 256], Blocks: [1, 1, 1, 1]
     """
-    def __init__(self, num_classes: int = 3):
+    def __init__(self, num_classes: int = 3, classifier: bool = False):
         super().__init__(
             stage_channels=[32, 64, 128, 256],
             stage_blocks=[1, 1, 1, 1],
             lateral_channels=32,
             num_classes=num_classes,
-            use_se=False  # No SE for tiny
+            use_se=False,  # No SE for tiny
+            classifier=classifier
         )
 
 
@@ -212,12 +234,13 @@ class SmallDetector(DetectorBase):
     Small detector.
     Stages: [32, 64, 128, 256], Blocks: [2, 2, 2, 2]
     """
-    def __init__(self, num_classes: int = 3):
+    def __init__(self, num_classes: int = 3, classifier: bool = False):
         super().__init__(
             stage_channels=[32, 64, 128, 256],
             stage_blocks=[2, 2, 2, 2],
             lateral_channels=64,
-            num_classes=num_classes
+            num_classes=num_classes,
+            classifier=classifier
         )
 
 
@@ -226,12 +249,13 @@ class MediumDetector(DetectorBase):
     Medium detector.
     Stages: [48, 96, 192, 384], Blocks: [2, 3, 3, 2]
     """
-    def __init__(self, num_classes: int = 3):
+    def __init__(self, num_classes: int = 3, classifier: bool = False):
         super().__init__(
             stage_channels=[48, 96, 192, 384],
             stage_blocks=[2, 3, 3, 2],
             lateral_channels=96,
-            num_classes=num_classes
+            num_classes=num_classes,
+            classifier=classifier
         )
 
 
@@ -240,12 +264,13 @@ class LargeDetector(DetectorBase):
     Large detector.
     Stages: [64, 128, 256, 512], Blocks: [3, 4, 6, 3] (like ResNet-50)
     """
-    def __init__(self, num_classes: int = 3):
+    def __init__(self, num_classes: int = 3, classifier: bool = False):
         super().__init__(
             stage_channels=[64, 128, 256, 512],
             stage_blocks=[3, 4, 6, 3],
             lateral_channels=128,
-            num_classes=num_classes
+            num_classes=num_classes,
+            classifier=classifier
         )
 
 
@@ -254,12 +279,13 @@ class XLargeDetector(DetectorBase):
     XLarge detector (~28M params).
     Stages: [64, 128, 256, 512], Blocks: [3, 4, 23, 3] (like ResNet-101)
     """
-    def __init__(self, num_classes: int = 3):
+    def __init__(self, num_classes: int = 3, classifier: bool = False):
         super().__init__(
             stage_channels=[64, 128, 256, 512],
             stage_blocks=[3, 4, 23, 3],
             lateral_channels=128,
-            num_classes=num_classes
+            num_classes=num_classes,
+            classifier=classifier
         )
 
 
@@ -268,12 +294,13 @@ class HugeDetector(DetectorBase):
     Huge detector (~50M params).
     Stages: [128, 256, 512, 1024], Blocks: [3, 4, 6, 3]
     """
-    def __init__(self, num_classes: int = 3):
+    def __init__(self, num_classes: int = 3, classifier: bool = False):
         super().__init__(
             stage_channels=[128, 256, 512, 1024],
             stage_blocks=[3, 4, 6, 3],
             lateral_channels=256,
-            num_classes=num_classes
+            num_classes=num_classes,
+            classifier=classifier
         )
 
 
@@ -644,16 +671,17 @@ class GiantDetectorOrginal(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-def get_model(size: str = 'tiny', num_classes: int = 3) -> nn.Module:
+def get_model(size: str = 'tiny', num_classes: int = 3, classifier: bool = False) -> nn.Module:
     """
-    Factory function to create a detector model.
+    Factory function to create a detector or classifier model.
     
     Args:
-        size: Model size - 'tiny', 'small', 'medium', 'large', 'xlarge', 'huge', 'giant', or 'yolo'
-        num_classes: Number of object classes
+        size: Model size - 'tiny', 'small', 'medium', 'large', 'xlarge', 'huge', 'giant', or 'giant_original'
+        num_classes: Number of object or classification classes
+        classifier: Whether to use classification head
         
     Returns:
-        Detector model instance
+        Model instance
     """
     models = {
         'tiny': TinyDetector,
@@ -669,4 +697,45 @@ def get_model(size: str = 'tiny', num_classes: int = 3) -> nn.Module:
     if size not in models:
         raise ValueError(f"Unknown model size: {size}. Choose from {list(models.keys())}")
     
-    return models[size](num_classes=num_classes)
+    # Check if the class supports the classifier argument
+    import inspect
+    model_class = models[size]
+    sig = inspect.signature(model_class.__init__)
+    if 'classifier' in sig.parameters:
+        return model_class(num_classes=num_classes, classifier=classifier)
+    else:
+        # GiantDetector and its variants might not support it yet unless updated
+        if classifier:
+             print(f"[WARNING] Model size '{size}' does not support classifier mode. Defaulting to detection.")
+        return model_class(num_classes=num_classes)
+
+
+# Convenience aliases for classifiers
+TinyClassifier = lambda num_classes=3: get_model('tiny', num_classes, classifier=True)
+SmallClassifier = lambda num_classes=3: get_model('small', num_classes, classifier=True)
+MediumClassifier = lambda num_classes=3: get_model('medium', num_classes, classifier=True)
+LargeClassifier = lambda num_classes=3: get_model('large', num_classes, classifier=True)
+XLargeClassifier = lambda num_classes=3: get_model('xlarge', num_classes, classifier=True)
+HugeClassifier = lambda num_classes=3: get_model('huge', num_classes, classifier=True)
+
+SimpleClassifier = LargeClassifier
+
+
+if __name__ == "__main__":
+    print("Testing PyTorch Model (with Classifier Support)")
+    x = torch.randn(2, 3, 224, 224)
+    
+    # Test detector
+    print("\n--- Detector Mode ---")
+    model = get_model('tiny', classifier=False)
+    print(f"Parameters: {model.get_params_count():,}")
+    output = model(x)
+    print(f"Output shape: {output.shape}")
+    
+    # Test classifier
+    print("\n--- Classifier Mode ---")
+    classifier = get_model('tiny', num_classes=10, classifier=True)
+    print(f"Parameters: {classifier.get_params_count():,}")
+    output = classifier(x)
+    print(f"Output shape: {output.shape}")
+    print(f"Sum of probs per sample: {output.sum(dim=1)}")
